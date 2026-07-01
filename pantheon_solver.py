@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Pantheon Pact Tree Optimal Build Solver – Nicer HTML Output
-============================================================
-- Generates HTML in the style of the original v5 guide.
-- Core effect filtering per archetype.
-- Duplicate budgets shown with (same as previous) label.
-- Floating nodes are disallowed (except roots) – Berserker empty with note.
+Pantheon Pact Tree Optimal Build Solver – With Prerequisite Overrides
+====================================================================
+- Temporary patches for floating nodes (22, 23, 24, 175, 239, 279).
+- Adds sensible prerequisites so they are not floating.
+- If the game data is fixed, remove the overrides.
 """
 
 import json
@@ -15,7 +14,7 @@ from collections import defaultdict
 from pulp import LpProblem, LpMaximize, LpVariable, lpSum, value, PULP_CBC_CMD
 
 # ---------------------------------------------------------------------------
-# ARCHETYPE WEIGHT PRESETS
+# ARCHETYPE WEIGHT PRESETS (unchanged)
 # ---------------------------------------------------------------------------
 ARCHETYPE_WEIGHTS = {
     "Melee DPS": {
@@ -163,6 +162,25 @@ GOD_ROOTS    = {1, 2, 3, 4, 5, 6}
 ALL_NODE_IDS = list(nodes.keys())
 
 # ---------------------------------------------------------------------------
+# TEMPORARY PREREQUISITE OVERRIDES FOR FLOATING NODES
+# These should be removed once the game data is fixed.
+# ---------------------------------------------------------------------------
+PREREQ_OVERRIDES = {
+    22: [6],   # Blindbag -> Bandos root
+    23: [6],   # Goliath's Reach -> Bandos root
+    24: [23],  # Berserker -> Goliath's Reach
+    175: [174], # Stalwart -> Stalwart 3
+    239: [100], # Pious Penetrator -> Pious Penetrator 3
+    279: [205], # Bandos's Wrath -> Floor Striker
+}
+
+# Apply overrides
+for nid, new_pre in PREREQ_OVERRIDES.items():
+    if nid in prereq:
+        prereq[nid] = new_pre
+        # Also need to update the size? No.
+
+# ---------------------------------------------------------------------------
 # Verification – no floating nodes (except roots)
 # ---------------------------------------------------------------------------
 def is_valid_build(selected, root):
@@ -253,7 +271,7 @@ def aggregate_effects(selected_ids):
     return totals
 
 # ---------------------------------------------------------------------------
-# Greedy fallback – no floating nodes
+# Greedy fallback – no floating nodes (respects overrides)
 # ---------------------------------------------------------------------------
 def greedy_build(weights, root, budget):
     node_marginal_score = precompute_marginal_scores(weights)
@@ -291,7 +309,7 @@ def greedy_build(weights, root, budget):
         return frozenset({root})
 
 # ---------------------------------------------------------------------------
-# ILP solver – no floating nodes
+# ILP solver – no floating nodes (respects overrides)
 # ---------------------------------------------------------------------------
 def solve_archetype(weights, root, budget, prev_solution=None):
     candidate_nodes = [nid for nid in ALL_NODE_IDS if cost_map[nid] <= budget]
@@ -360,7 +378,7 @@ def solve_archetype(weights, root, budget, prev_solution=None):
             greedy = greedy_build(weights, root, budget)
             score = sum(node_marginal_score[nid] for nid in greedy)
             return greedy, score
-    except:
+    except Exception:
         greedy = greedy_build(weights, root, budget)
         score = sum(node_marginal_score[nid] for nid in greedy)
         return greedy, score
@@ -448,7 +466,7 @@ a.btn:hover{background:#161c36;color:#8898e8;border-color:#343860}
 </head>
 <body>
 <h1>Pantheon Pact Tree &mdash; Build Guide</h1>
-<p class="sub">8 archetypes &middot; 5&ndash;150pt &middot; ILP exact solver &middot; Core effect filtering &middot; Floating nodes disallowed (except roots)</p>
+<p class="sub">8 archetypes &middot; 5&ndash;150pt &middot; ILP exact solver &middot; Core effect filtering &middot; Temporary prerequisite patches applied</p>
 <div class="tabs">
 """)
 
@@ -488,7 +506,7 @@ a.btn:hover{background:#161c36;color:#8898e8;border-color:#343860}
             "Ranged DPS": "Maximises ranged max hit, distance bonuses, and bolt effects.",
             "Magic DPS": "Prioritises magic max hit, staff speed, and chaos echoes.",
             "Hammer / Prayer": "Orbiting hammers scale with prayer bonus. Only builds with hammers are shown.",
-            "Berserker": "Low‑HP, high‑risk melee with berserker and blindbag. <span class='note'>⚠️ The Berserker keystone (node 24) is currently a floating node (no prerequisites) and is not allowed. Until the game data is fixed, no Berserker builds are available.</span>",
+            "Berserker": "Low‑HP, high‑risk melee with berserker and blindbag.",
             "Sustain / Tank": "Stacks damage reduction, HP, lifesteal, and reflect.",
             "Summoner / Pet": "Boosts pet and summon damage.",
             "Slayer / Hybrid": "Balanced all‑styles with slayer helm and prayer penetration."
@@ -529,7 +547,6 @@ a.btn:hover{background:#161c36;color:#8898e8;border-color:#343860}
                 short = k.replace('perk_graph_effect:pantheon_', '')
                 if weights.get(k, 0) > 0 and v > 0:
                     relevant[short] = v
-            # Sort by weighted contribution
             top = sorted(relevant.items(), key=lambda kv: -weights.get(f'perk_graph_effect:pantheon_{kv[0]}', 1) * kv[1])[:5]
             pill_html = ''.join(f'<span class="pill {get_pill_class(k)}">{k}={v:.0f}</span> ' for k, v in top)
             if not pill_html:
@@ -554,18 +571,17 @@ a.btn:hover{background:#161c36;color:#8898e8;border-color:#343860}
 
         html_parts.append('</tbody></table></div>')
 
-    # Note box (v5 style)
     html_parts.append("""
     <div class="note-box"><h3>How builds work</h3>
     <ul>
-        <li><strong>Keystones require ALL listed prerequisites</strong>, small/medium nodes need only one. This means the Paladin chain (needing both Spear of Light and Defenders as Shields) costs 17pt minimum – it cannot appear in a 15pt build.</li>
-        <li><strong>Sara and Bandos share 312 of 314 nodes.</strong> The root choice only affects which nodes cost fewer points to reach first. Sara wins for 1H melee because One-Handed Affinity is 2pt closer. Bandos wins for 2H/Flurry because those nodes are 2pt closer. The solver correctly picks the root that gives cheapest access.</li>
-        <li><strong>Root switches</strong> are marked by a new row with a different god – pay attention if you’re following a specific root.</li>
-        <li><strong>Duplicate rows</strong> labelled <span style="color:#5a4a60;">(same as previous)</span> mean the optimal build hasn’t changed – you can safely skip those points.</li>
-        <li><strong>Floating nodes</strong> (nodes with no prerequisites) are <strong>not allowed</strong> – only roots may be selected without prerequisites. The Berserker keystone (node 24) is currently a floating node, so no Berserker builds are shown until the game data is fixed.</li>
-        <li><strong>Devout Vessel</strong> = HP bonus from prayer bonus %, not prayer damage. Excluded from Hammer DPS, included in Sustain/Tank.</li>
-        <li><strong>Flurry</strong> = next attack fires 1 tick sooner, not a double hit. 50% proc on a 4‑tick weapon = ~12.5% more attacks.</li>
-        <li><strong>Crackling Staff</strong> halves powered‑staff attack speed, roughly doubling cast DPS. Highest value magic node.</li>
+        <li><strong>Keystones require ALL listed prerequisites</strong>, small/medium nodes need only one.</li>
+        <li><strong>Sara and Bandos share 312 of 314 nodes.</strong> The root choice affects which nodes are cheaper to reach.</li>
+        <li><strong>Root switches</strong> are marked by a new row with a different god.</li>
+        <li><strong>Duplicate rows</strong> labelled <span style="color:#5a4a60;">(same as previous)</span> mean the optimal build hasn’t changed.</li>
+        <li><strong>Temporary prerequisite patches</strong> have been applied for nodes that were previously floating (22, 23, 24, 175, 239, 279). These will be removed once the game data is fixed.</li>
+        <li><strong>Devout Vessel</strong> = HP bonus from prayer bonus %, not damage.</li>
+        <li><strong>Flurry</strong> = next attack fires 1 tick sooner.</li>
+        <li><strong>Crackling Staff</strong> halves powered‑staff attack speed.</li>
         <li>Use the <strong>Planner</strong> link to see the exact node selection and total cost.</li>
     </ul></div>
     <script>
@@ -581,21 +597,21 @@ a.btn:hover{background:#161c36;color:#8898e8;border-color:#343860}
 
     return ''.join(html_parts)
 
-# Helper function to pick pill colour based on stat name (replicates old style)
+# Helper function to pick pill colour based on stat name
 def get_pill_class(short_name):
     short = short_name.lower()
     if 'damage' in short or 'max_hit' in short:
-        return 'pd'   # damage (red)
+        return 'pd'
     elif 'min_hit' in short:
-        return 'pu'   # min hit (green)
+        return 'pu'
     elif 'lifesteal' in short or 'heal' in short:
-        return 'ps'   # sustain (blue)
+        return 'ps'
     elif 'prayer' in short or 'faith' in short or 'devout' in short:
-        return 'pp'   # prayer (gold)
+        return 'pp'
     elif 'crit' in short:
-        return 'pc'   # crit (purple)
+        return 'pc'
     else:
-        return 'px'   # neutral (grey)
+        return 'px'
 
 # ---------------------------------------------------------------------------
 # Main
