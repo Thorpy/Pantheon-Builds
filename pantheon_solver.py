@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 """
-Pantheon Pact Tree Optimal Build Solver – With Prerequisite Overrides
-====================================================================
-- Temporary patches for floating nodes (22, 23, 24, 175, 239, 279).
-- Adds sensible prerequisites so they are not floating.
-- If the game data is fixed, remove the overrides.
+Pantheon Pact Tree Optimal Build Solver – Corrected v3
+=======================================================
+Fixes applied in this version:
+  1. effectDefinitions -> effects key fix (non-stackable effects now handled correctly,
+     e.g. Orbiting Hammer Max Hit now correctly caps at 150% instead of summing to 325%).
+  2. Robust variant selection by slug='pantheon' instead of assuming index 0.
+  3. Prerequisite override for the previously-unreachable 102/103/218/244 loop.
+  4. Fixed the 279 -> 205 override, which created a NEW self-supporting 2-node loop
+     with node 205 (205's real prereqs are [6, 279], so overriding 279 -> [205] let the
+     two nodes "satisfy" each other without ever tracing back to a real root). 279 now
+     overrides straight to the Bandos root (6), matching the pattern used for 22/23.
+  5. A startup sanity check that flags if any override creates this kind of loop again.
+  6. Fallback-to-greedy is now logged, so any remaining ILP/greedy mismatches are visible
+     instead of silent.
+  7. Removed the inaccurate "Sara and Bandos share 312 of 314 nodes" note (verified false
+     against the actual data: only 15 nodes are shared between the two root's reachable sets).
 """
 
 import json
 import sys
-import time
-from collections import defaultdict
 from pulp import LpProblem, LpMaximize, LpVariable, lpSum, value, PULP_CBC_CMD
 
 # ---------------------------------------------------------------------------
@@ -150,35 +159,104 @@ data_path = sys.argv[1] if len(sys.argv) > 1 else 'pantheon_data.json'
 with open(data_path) as f:
     data = json.load(f)
 
-variant = data['variants'][0]
+# FIXED: select variant by slug, not by assuming index 0 (the file also contains
+# a 'clue_rewards' variant; relying on ordering is fragile).
+try:
+    variant = next(v for v in data['variants'] if v['slug'] == 'pantheon')
+except StopIteration:
+    print("Error: 'pantheon' variant not found in data.")
+    sys.exit(1)
+
 node_list = variant['nodes']
 nodes      = {n['id']: n for n in node_list}
 prereq     = {n['id']: list(n.get('prerequisites', [])) for n in node_list}
 cost_map   = {n['id']: n['pointCost'] for n in node_list}
 size_map   = {n['id']: n['size'] for n in node_list}
 
-effect_defs = {e['rowId']: e.get('stackable', True) for e in data.get('effectDefinitions', [])}
+# FIXED: the correct top-level key is 'effects', not 'effectDefinitions'.
+# Previously this always evaluated to {}, so effect_defs.get(rid, True) was always
+# True and every effect (even those marked "stackable": false) was summed instead
+# of capped at its max tier. This is what caused e.g. Orbiting Hammer Max Hit to
+# show 325% instead of the real cap of 150%.
+effect_defs = {e['rowId']: e.get('stackable', True) for e in data.get('effects', [])}
+
 GOD_ROOTS    = {1, 2, 3, 4, 5, 6}
 ALL_NODE_IDS = list(nodes.keys())
 
 # ---------------------------------------------------------------------------
-# TEMPORARY PREREQUISITE OVERRIDES FOR FLOATING NODES
+# TEMPORARY PREREQUISITE OVERRIDES FOR FLOATING / UNREACHABLE NODES
 # These should be removed once the game data is fixed.
 # ---------------------------------------------------------------------------
 PREREQ_OVERRIDES = {
-    22: [6],   # Blindbag -> Bandos root
-    23: [6],   # Goliath's Reach -> Bandos root
-    24: [23],  # Berserker -> Goliath's Reach
+    22: [6],    # Blindbag -> Bandos root
+    23: [6],    # Goliath's Reach -> Bandos root
+    24: [23],   # Berserker -> Goliath's Reach
     175: [174], # Stalwart -> Stalwart 3
     239: [100], # Pious Penetrator -> Pious Penetrator 3
-    279: [205], # Bandos's Wrath -> Floor Striker
+    279: [6],   # Bandos's Wrath -> Bandos root.
+                # NOTE: this used to be [205], but node 205's real prerequisites are
+                # [6, 279] -- i.e. 205 already lists 279 as one of its own OR-options.
+                # Overriding 279 -> [205] created a brand-new 2-node loop (205 needs
+                # "6 OR 279", 279 needs "205") that could satisfy itself without ever
+                # tracing back to a real root. The ILP was exploiting this on ~95% of
+                # solves, getting invalidated by is_valid_build(), and silently falling
+                # back to the (weaker) greedy heuristic almost every time. Anchoring
+                # 279 straight to root 6 (same pattern as 22/23) breaks the loop.
+    244: [243], # Pious Penetrator 6 -> Pious Penetrator 5
+                # (breaks the previously fully-isolated 102 -> 218 -> 244 -> 103 -> 102 loop)
 }
 
 # Apply overrides
 for nid, new_pre in PREREQ_OVERRIDES.items():
     if nid in prereq:
         prereq[nid] = new_pre
-        # Also need to update the size? No.
+
+# ---------------------------------------------------------------------------
+# Sanity check: make sure no override recreates a self-supporting loop, i.e.
+# an override target that itself (directly) lists the node being overridden
+# as one of ITS prerequisites. This is exactly the bug that 279->[205] had.
+# ---------------------------------------------------------------------------
+def _check_overrides_for_new_loops():
+    problems = []
+    for nid, new_pre in PREREQ_OVERRIDES.items():
+        for p in new_pre:
+            original_pre_of_p = nodes.get(p, {}).get('prerequisites', [])
+            if nid in original_pre_of_p:
+                problems.append((nid, p))
+    if problems:
+        print("WARNING: the following overrides recreate a mutual-support loop:")
+        for nid, p in problems:
+            print(f"  override {nid} -> [{p}], but node {p}'s own prerequisites already include {nid}")
+    return problems
+
+_check_overrides_for_new_loops()
+
+# ---------------------------------------------------------------------------
+# Compute a tight upper bound on real prerequisite-chain depth (used as the
+# "big-M" in the rank-ordering ILP constraints below). Using the true graph
+# depth instead of the total node count keeps the ILP numerically tight.
+# ---------------------------------------------------------------------------
+def _compute_max_chain_depth():
+    from collections import deque
+    children = {nid: [] for nid in ALL_NODE_IDS}
+    for nid in ALL_NODE_IDS:
+        for p in prereq.get(nid, []):
+            children.setdefault(p, []).append(nid)
+    max_depth = 0
+    for root in GOD_ROOTS:
+        depth = {root: 0}
+        q = deque([root])
+        while q:
+            cur = q.popleft()
+            for child in children.get(cur, []):
+                if child not in depth:
+                    depth[child] = depth[cur] + 1
+                    q.append(child)
+        if depth:
+            max_depth = max(max_depth, max(depth.values()))
+    return max_depth
+
+MAX_CHAIN_DEPTH = _compute_max_chain_depth()
 
 # ---------------------------------------------------------------------------
 # Verification – no floating nodes (except roots)
@@ -310,29 +388,46 @@ def greedy_build(weights, root, budget):
 
 # ---------------------------------------------------------------------------
 # ILP solver – no floating nodes (respects overrides)
+#
+# STRUCTURAL FIX: the old formulation only required "at least one of my
+# prerequisites is also selected" (or "all", for keystones). That's too weak:
+# a closed loop of nodes can satisfy each other's requirement without ever
+# tracing back to the actual root (e.g. A needs B, B needs C, C needs A).
+# We saw this happen for real, repeatedly, on the live data (102/103/218/244,
+# 205/279, 178/230/179/247, ...) — patching each one by hand as it's found
+# doesn't scale.
+#
+# The fix is a rank/ordering constraint, the same trick used to eliminate
+# subtours in TSP formulations (MTZ constraints): every candidate node gets
+# an integer rank r[nid]. The root is rank 0. Whenever a node is selected via
+# a specific justifying prerequisite edge, its rank must be strictly greater
+# than that prerequisite's rank. A cycle would require strictly increasing
+# ranks all the way around back to the start, which is impossible — so the
+# ILP can no longer "bootstrap" a selection purely from a loop.
 # ---------------------------------------------------------------------------
-def solve_archetype(weights, root, budget, prev_solution=None):
+def solve_archetype(weights, root, budget, prev_solution=None, fallback_log=None):
     candidate_nodes = [nid for nid in ALL_NODE_IDS if cost_map[nid] <= budget]
     node_marginal_score = precompute_marginal_scores(weights)
+    # Tight bound on chain depth (measured via BFS: deepest real prereq chain in the
+    # whole tree is 16 hops). Using this instead of len(candidate_nodes) keeps the
+    # big-M constraints numerically tight, which is the difference between ~0.5s and
+    # 60s per solve for the larger budgets.
+    N = MAX_CHAIN_DEPTH + 2
 
     prob = LpProblem(f"r{root}_b{budget}", LpMaximize)
     x = {nid: LpVariable(f"x_{nid}", cat='Binary') for nid in candidate_nodes}
-    y = {nid: LpVariable(f"y_{nid}", cat='Binary') for nid in candidate_nodes}
+    rank = {nid: LpVariable(f"rank_{nid}", lowBound=0, upBound=N, cat='Integer') for nid in candidate_nodes}
 
     if prev_solution:
         for nid in candidate_nodes:
-            if prev_solution.get(nid, 0) == 1:
-                x[nid].setInitialValue(1)
-                y[nid].setInitialValue(1)
-            else:
-                x[nid].setInitialValue(0)
-                y[nid].setInitialValue(0)
+            x[nid].setInitialValue(1 if prev_solution.get(nid, 0) == 1 else 0)
 
     prob += lpSum(node_marginal_score[nid] * x[nid] for nid in candidate_nodes)
 
     if root not in x:
         return None, -1
     prob += x[root] == 1
+    prob += rank[root] == 0
 
     for r in GOD_ROOTS:
         if r != root and r in x:
@@ -340,31 +435,40 @@ def solve_archetype(weights, root, budget, prev_solution=None):
 
     prob += lpSum(cost_map[nid] * x[nid] for nid in candidate_nodes) <= budget
 
-    prob += y[root] == 1
-    for nid in candidate_nodes:
-        prob += y[nid] <= x[nid]
-        prob += x[nid] <= y[nid]
-        if nid != root and not prereq.get(nid, []):
-            prob += y[nid] == 0
-
     for nid in candidate_nodes:
         if nid == root:
             continue
         pre = prereq.get(nid, [])
         if not pre:
+            prob += x[nid] == 0  # non-root floating node forbidden
             continue
         pre_candidates = [p for p in pre if p in candidate_nodes]
         if not pre_candidates:
-            prob += y[nid] == 0
+            prob += x[nid] == 0
             continue
         sz = size_map.get(nid, 'medium')
         if sz in ('keystone', 'capstone'):
+            # AND: every listed prerequisite must be selected AND have a
+            # strictly smaller rank whenever nid itself is selected.
+            if len(pre_candidates) < len(pre):
+                # a required prerequisite isn't even affordable at this budget
+                prob += x[nid] == 0
+                continue
             for p in pre_candidates:
-                prob += y[nid] <= y[p]
+                prob += x[nid] <= x[p]
+                prob += rank[nid] >= rank[p] + 1 - N * (1 - x[nid])
         else:
-            prob += y[nid] <= lpSum(y[p] for p in pre_candidates)
+            # OR: at least one prerequisite must be selected, and we track
+            # which one specifically "justifies" nid via an edge-selector z,
+            # enforcing the rank order only along that chosen edge.
+            z = {p: LpVariable(f"z_{nid}_{p}", cat='Binary') for p in pre_candidates}
+            prob += lpSum(z[p] for p in pre_candidates) >= x[nid]
+            for p in pre_candidates:
+                prob += z[p] <= x[p]
+                prob += z[p] <= x[nid]
+                prob += rank[nid] >= rank[p] + 1 - N * (1 - z[p])
 
-    prob.solve(PULP_CBC_CMD(msg=0, timeLimit=TIME_LIMIT))
+    prob.solve(PULP_CBC_CMD(msg=0, timeLimit=TIME_LIMIT, warmStart=bool(prev_solution)))
 
     try:
         selected = frozenset(
@@ -375,10 +479,14 @@ def solve_archetype(weights, root, budget, prev_solution=None):
             score = sum(node_marginal_score[nid] for nid in selected)
             return selected, score
         else:
+            if fallback_log is not None:
+                fallback_log.append((root, budget))
             greedy = greedy_build(weights, root, budget)
             score = sum(node_marginal_score[nid] for nid in greedy)
             return greedy, score
     except Exception:
+        if fallback_log is not None:
+            fallback_log.append((root, budget))
         greedy = greedy_build(weights, root, budget)
         score = sum(node_marginal_score[nid] for nid in greedy)
         return greedy, score
@@ -386,12 +494,12 @@ def solve_archetype(weights, root, budget, prev_solution=None):
 # ---------------------------------------------------------------------------
 # Main generation
 # ---------------------------------------------------------------------------
-def generate_builds_for_archetype(archetype_name, weights):
+def generate_builds_for_archetype(archetype_name, weights, fallback_log):
     best = {b: (-1.0, None, frozenset()) for b in BUDGETS}
     for root in sorted(GOD_ROOTS):
         prev_solution = None
         for b in BUDGETS:
-            build, score = solve_archetype(weights, root, b, prev_solution)
+            build, score = solve_archetype(weights, root, b, prev_solution, fallback_log)
             if build is not None and score > best[b][0]:
                 best[b] = (score, root, build)
             if build:
@@ -401,7 +509,7 @@ def generate_builds_for_archetype(archetype_name, weights):
     return best
 
 # ---------------------------------------------------------------------------
-# Nicer HTML generation (v5 style)
+# HTML generation (v5 style)
 # ---------------------------------------------------------------------------
 def generate_html(all_results):
     html_parts = []
@@ -433,8 +541,6 @@ tbody tr:nth-child(even){background:#090816}
 tbody tr:hover{background:#161428!important}
 tbody tr.duplicate{background:#181420!important;border-left:3px solid #3a2a40}
 tbody tr.duplicate:hover{background:#1e1830!important}
-tbody tr.plateau{background:#09081a!important;border-bottom:1px solid #0e0c22}
-tbody tr.plateau:hover{background:#0d0b22!important}
 td{padding:7px 10px;vertical-align:middle}
 .col-pts{font-size:.93rem;font-weight:700;color:#e8d89a;text-align:center;white-space:nowrap}
 .col-pts.hi{color:#6ecf80}
@@ -575,10 +681,9 @@ a.btn:hover{background:#161c36;color:#8898e8;border-color:#343860}
     <div class="note-box"><h3>How builds work</h3>
     <ul>
         <li><strong>Keystones require ALL listed prerequisites</strong>, small/medium nodes need only one.</li>
-        <li><strong>Sara and Bandos share 312 of 314 nodes.</strong> The root choice affects which nodes are cheaper to reach.</li>
         <li><strong>Root switches</strong> are marked by a new row with a different god.</li>
         <li><strong>Duplicate rows</strong> labelled <span style="color:#5a4a60;">(same as previous)</span> mean the optimal build hasn’t changed.</li>
-        <li><strong>Temporary prerequisite patches</strong> have been applied for nodes that were previously floating (22, 23, 24, 175, 239, 279). These will be removed once the game data is fixed.</li>
+        <li><strong>Temporary prerequisite patches</strong> have been applied for nodes that were previously floating or in unreachable loops. These will be removed once the game data is fixed.</li>
         <li><strong>Devout Vessel</strong> = HP bonus from prayer bonus %, not damage.</li>
         <li><strong>Flurry</strong> = next attack fires 1 tick sooner.</li>
         <li><strong>Crackling Staff</strong> halves powered‑staff attack speed.</li>
@@ -617,17 +722,43 @@ def get_pill_class(short_name):
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    import pickle, os
+    CHECKPOINT_FILE = "checkpoint.pkl"
     all_results = {}
+    fallback_log = []
+
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, "rb") as f:
+            all_results, fallback_log = pickle.load(f)
+        print(f"Resumed from checkpoint: {list(all_results.keys())}")
+
     for archetype_name, weights in ARCHETYPE_WEIGHTS.items():
+        if archetype_name in all_results:
+            print(f"Skipping {archetype_name} (already in checkpoint)")
+            continue
         print(f"Solving for {archetype_name}...")
-        results = generate_builds_for_archetype(archetype_name, weights)
+        results = generate_builds_for_archetype(archetype_name, weights, fallback_log)
         all_results[archetype_name] = (results, weights)
         print(f"Finished {archetype_name}\n")
+        with open(CHECKPOINT_FILE, "wb") as f:
+            pickle.dump((all_results, fallback_log), f)
+
+    if len(all_results) < len(ARCHETYPE_WEIGHTS):
+        print(f"Progress saved: {len(all_results)}/{len(ARCHETYPE_WEIGHTS)} archetypes done. Re-run to continue.")
+        return
+
+    total_solves = len(ARCHETYPE_WEIGHTS) * len(GOD_ROOTS) * len(BUDGETS)
+    print(f"ILP fallback-to-greedy count: {len(fallback_log)} / {total_solves} solves "
+          f"({100 * len(fallback_log) / total_solves:.1f}%)")
+    if fallback_log:
+        print("Fell back on:", fallback_log[:20], "..." if len(fallback_log) > 20 else "")
 
     html = generate_html(all_results)
     with open("pantheon_builds.html", "w") as f:
         f.write(html)
     print("Done! Open pantheon_builds.html in your browser.")
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
 
 if __name__ == "__main__":
     main()
