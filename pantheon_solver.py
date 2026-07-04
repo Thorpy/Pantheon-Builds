@@ -184,52 +184,56 @@ GOD_ROOTS    = {1, 2, 3, 4, 5, 6}
 ALL_NODE_IDS = list(nodes.keys())
 
 # ---------------------------------------------------------------------------
-# TEMPORARY PREREQUISITE OVERRIDES FOR FLOATING / UNREACHABLE NODES
-# These should be removed once the game data is fixed.
+# HARDCODED PREREQUISITE FIXES — BEST AVAILABLE INFERENCE, NOT DEV-CONFIRMED
+# ---------------------------------------------------------------------------
+# These nodes have missing/broken prerequisites in the raw export. A dev
+# confirmed the *bug itself* is real (prerequisites are supposed to exist)
+# but did not provide the exact intended values. The values below are the
+# best-supported guesses from this investigation:
+#   - Every other god's capstone requires 3 keystones that each have 2 real
+#     medium-tier prerequisites. Bandos is the only exception (22/23/24 all
+#     empty) — confirmed a genuine gap, not intentional design.
+#   - 22 (Blindbag): user-confirmed the real relationship is OR, not the
+#     usual keystone AND — either of the two "Echoes" nodes unlocks it.
+#   - 23/24: no direct confirmation: best-supported pair per the same
+#     cross-branch feeder pattern used by every other god's keystones.
+#   - 175, 239: single best spatial/connectivity candidate from the graph.
+#   - 279: matches the same hub (205) its two siblings both connect through.
+#   - 244: breaks the isolated 102/103/218/244 loop (no external anchor
+#     found anywhere in the data for this cluster; this is the weakest link
+#     in this whole set — treat it with the most suspicion).
+#
+# IMPORTANT: none of this has been verified against the live planner or
+# server logic — the planner reads the same broken source data we do, so it
+# cannot confirm or deny these values either. If any of these turn out wrong
+# once real data is available, update PREREQ_OVERRIDES (and OR_LOGIC_NODES
+# if the AND/OR type is also wrong) — and ideally push the real values into
+# pantheon_data.json directly so the live planner agrees too.
 # ---------------------------------------------------------------------------
 PREREQ_OVERRIDES = {
-    22: [6],    # Blindbag -> Bandos root
-    23: [6],    # Goliath's Reach -> Bandos root
-    24: [23],   # Berserker -> Goliath's Reach
-    175: [174], # Stalwart -> Stalwart 3
-    239: [100], # Pious Penetrator -> Pious Penetrator 3
-    279: [6],   # Bandos's Wrath -> Bandos root.
-                # NOTE: this used to be [205], but node 205's real prerequisites are
-                # [6, 279] -- i.e. 205 already lists 279 as one of its own OR-options.
-                # Overriding 279 -> [205] created a brand-new 2-node loop (205 needs
-                # "6 OR 279", 279 needs "205") that could satisfy itself without ever
-                # tracing back to a real root. The ILP was exploiting this on ~95% of
-                # solves, getting invalidated by is_valid_build(), and silently falling
-                # back to the (weaker) greedy heuristic almost every time. Anchoring
-                # 279 straight to root 6 (same pattern as 22/23) breaks the loop.
-    244: [243], # Pious Penetrator 6 -> Pious Penetrator 5
-                # (breaks the previously fully-isolated 102 -> 218 -> 244 -> 103 -> 102 loop)
+    22: [330, 331],   # Blindbag <- Berserker Echoes 2 / 3 (OR — see OR_LOGIC_NODES below)
+    23: [328, 325],   # Goliath's Reach <- Goliath Reaching Echo + Blindbag Cutting Edge (AND, best-guess pair)
+    24: [326, 327],   # Berserker <- Goliath Long Haft + Goliath Pressure Strike (AND, best-guess pair)
+    175: [100],       # Stalwart 4 <- nearest connected node (neutral_prayer_pen_3)
+    239: [9],         # Pious Penetrator 1 <- Sara's Devotion keystone (nearest connected candidate)
+    279: [205],       # Bandos's Wrath 2 <- same hub (205) as siblings Wrath 1 and Wrath 3
+    244: [243],       # Pious Penetrator 6 <- Pious Penetrator 5 (breaks the 102/103/218/244 loop)
 }
 
-# Apply overrides
+# Nodes where the true logic differs from what `size` alone implies.
+# Every other keystone in the tree uses AND (all listed prereqs required).
+# 22 is confirmed to use OR instead (either listed prereq is enough).
+OR_LOGIC_NODES = {22}
+
 for nid, new_pre in PREREQ_OVERRIDES.items():
     if nid in prereq:
         prereq[nid] = new_pre
 
-# ---------------------------------------------------------------------------
-# Sanity check: make sure no override recreates a self-supporting loop, i.e.
-# an override target that itself (directly) lists the node being overridden
-# as one of ITS prerequisites. This is exactly the bug that 279->[205] had.
-# ---------------------------------------------------------------------------
-def _check_overrides_for_new_loops():
-    problems = []
-    for nid, new_pre in PREREQ_OVERRIDES.items():
-        for p in new_pre:
-            original_pre_of_p = nodes.get(p, {}).get('prerequisites', [])
-            if nid in original_pre_of_p:
-                problems.append((nid, p))
-    if problems:
-        print("WARNING: the following overrides recreate a mutual-support loop:")
-        for nid, p in problems:
-            print(f"  override {nid} -> [{p}], but node {p}'s own prerequisites already include {nid}")
-    return problems
-
-_check_overrides_for_new_loops()
+def _uses_and_logic(nid, sz):
+    """True if nid requires ALL its prerequisites (keystone/capstone default),
+    False if it only needs ANY ONE (small/medium default, or an explicit
+    OR_LOGIC_NODES exception like node 22)."""
+    return sz in ('keystone', 'capstone') and nid not in OR_LOGIC_NODES
 
 # ---------------------------------------------------------------------------
 # Compute a tight upper bound on real prerequisite-chain depth (used as the
@@ -271,7 +275,7 @@ def is_valid_build(selected, root):
         if not pre:
             return False  # non‑root floating node forbidden
         sz = size_map.get(nid, 'medium')
-        if sz in ('keystone', 'capstone'):
+        if _uses_and_logic(nid, sz):
             if not all(p in selected for p in pre):
                 return False
         else:
@@ -289,7 +293,7 @@ def is_valid_build(selected, root):
             if not pre:
                 continue
             sz = size_map.get(nid, 'medium')
-            if sz in ('keystone', 'capstone'):
+            if _uses_and_logic(nid, sz):
                 if all(p in reachable for p in pre):
                     reachable.add(nid)
                     changed = True
@@ -367,7 +371,7 @@ def greedy_build(weights, root, budget):
             if not pre:
                 continue  # non‑root floating node forbidden
             sz = size_map.get(nid, 'medium')
-            if sz in ('keystone', 'capstone'):
+            if _uses_and_logic(nid, sz):
                 if not all(p in selected for p in pre):
                     continue
             else:
@@ -447,7 +451,7 @@ def solve_archetype(weights, root, budget, prev_solution=None, fallback_log=None
             prob += x[nid] == 0
             continue
         sz = size_map.get(nid, 'medium')
-        if sz in ('keystone', 'capstone'):
+        if _uses_and_logic(nid, sz):
             # AND: every listed prerequisite must be selected AND have a
             # strictly smaller rank whenever nid itself is selected.
             if len(pre_candidates) < len(pre):
