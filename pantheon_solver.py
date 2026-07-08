@@ -354,14 +354,7 @@ _marginal_score_cache = {}
 def precompute_marginal_scores(weights, archetype_name=None):
     # Cache key: archetype_name alone is sufficient since each archetype has
     # exactly one fixed weights dict in ARCHETYPE_WEIGHTS — this function's
-    # result never varies across root/budget, only across archetype. Without
-    # this, the full node scan (including the get_all_prereqs walk for every
-    # non-stackable effect) ran 180 times per archetype instead of once —
-    # 1440 redundant full recomputations across the whole run. Note this
-    # cache is per-process under multiprocessing (each worker has its own
-    # copy), so it helps most when a worker handles several tasks from the
-    # same archetype in a row — which the task ordering already does, since
-    # tasks are generated grouped by archetype.
+    # result never varies across root/budget, only across archetype.
     if archetype_name is not None and archetype_name in _marginal_score_cache:
         return _marginal_score_cache[archetype_name]
     node_marginal_score = {}
