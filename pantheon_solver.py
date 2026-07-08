@@ -22,8 +22,7 @@ Verified against 4 independently-confirmed real examples (in-game click
 tests and the live planner's own "unreachable" flags) before use.
 
 Solving is parallelized across all CPU cores via multiprocessing, since the
-960 (archetype, root, budget) solves are fully independent. A GPU does not
-help here — CBC's branch-and-bound is inherently sequential per problem.
+960 (archetype, root, budget) solves are fully independent.
 """
 
 import os
@@ -229,27 +228,8 @@ ALL_NODE_IDS = list(nodes.keys())
 # free" model, and the god-exclusivity model — was an inference from examples and
 # is now known to be wrong in some respect. This is not an inference; it is a
 # direct transcription of the client's own functions tY/tV/tK.
+# (I couldn't work it out so stole logic from august planner once it was fixed.
 #
-# Key facts this reveals that no prior version had right:
-#  - Adjacency is UNDIRECTED. A node's "prerequisites" list creates a two-way edge:
-#    it can be validated via that listed parent, OR via any other node that lists
-#    IT as a prerequisite. Direction of the listed prerequisite does not gate
-#    which side must come "first".
-#  - A node is valid if it isRoot, OR its pointCost is 0, OR ANY undirected
-#    neighbor is already valid (pure OR across all neighbors — no AND logic on
-#    keystones at all).
-#  - specialRequirement has exactly two real cases:
-#      "perkgraph:all_links_unlocked" (capstones): all of the node's own DIRECT
-#        prerequisites must be valid (not the full ancestor tree).
-#      "pantheon:exclusive_alignment" (the 6 roots only): at most one node
-#        carrying this flag may be valid at once — i.e. exactly the single-root
-#        rule, with no other meaning.
-#  - There is NO god-exclusivity mechanic anywhere for keystone/capstone/small/
-#    medium nodes. A node with an empty prerequisite list and pointCost > 0 (e.g.
-#    22, 23, 24, 175, 239, 279) is only reachable via nodes that list IT as their
-#    OWN prerequisite (reverse edges) — it is not "free", and it is not
-#    "forbidden" either; it's exactly as reachable as any other node under the
-#    undirected-OR rule above.
 UNDIRECTED_ADJ = {nid: set() for nid in nodes}
 for _n in node_list:
     for _p in _n['prerequisites']:
@@ -292,21 +272,6 @@ def _reachable_set(selected):
     return valid
 
 # ---------------------------------------------------------------------------
-# NOTE: every previous version of this file had a block here for hardcoded
-# prerequisite overrides, OR_LOGIC_NODES exceptions, and AND-vs-OR-by-size
-# logic. All of that is now known to be unnecessary: the real client uses
-# plain undirected-OR reachability (see UNDIRECTED_ADJ / _reachable_set
-# above) for every node regardless of size, with no AND-logic anywhere
-# except the two explicit specialRequirement cases already handled in
-# _special_ok(). Nodes with empty prerequisite lists (22, 23, 24, 175, 239,
-# 279, etc.) are neither "free" nor "forbidden" — they're ordinary nodes
-# whose only edges come from OTHER nodes listing them as a prerequisite
-# (reverse edges), which UNDIRECTED_ADJ already captures correctly. No
-# guessed overrides, size-based AND/OR split, or god-exclusivity rule is
-# needed or correct. This whole block is intentionally empty now.
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Compute a tight upper bound on real prerequisite-chain depth (used as the
 # "big-M" in the rank-ordering ILP constraints below). Using the true graph
 # depth instead of the total node count keeps the ILP numerically tight.
@@ -315,6 +280,7 @@ def _reachable_set(selected):
 # undirected. It's still just a bound for the ILP's big-M, not a validity
 # rule, so a slightly loose bound here is fine.
 # ---------------------------------------------------------------------------
+
 def _compute_max_chain_depth():
     from collections import deque
     max_depth = 0
@@ -367,20 +333,7 @@ def get_all_prereqs(nid, _visiting=None):
     return visited
 
 # ---------------------------------------------------------------------------
-# MANUAL ABILITY SCORES — for nodes with NO numeric `effects`
-# ---------------------------------------------------------------------------
-# 54 nodes in this tree (every capstone, plus several keystones) grant real,
-# often build-defining mechanics that are only described in text, not encoded
-# as a numeric effect. The scoring model below can only ever value what's in
-# an `effects` array, so without this these nodes silently score 0 forever,
-# no matter how strong they are, and the solver will never recommend them.
-#
-# These numbers are Claude's own judgment calls from reading each node's
-# description, loosely calibrated against comparable weighted stats
-# elsewhere in this file (e.g. a 25%-damage stat with weight 4.0 scores 100).
-# THEY ARE NOT MEASURED DATA. Treat them as a reasonable starting point and
-# adjust freely — there is no way to derive these mechanically from the JSON.
-# ---------------------------------------------------------------------------
+
 MANUAL_ABILITY_SCORES = {
     8:   {'Hammer / Prayer': 20, 'Melee DPS': 10},   # Smite: +0.35%/pt equipped prayer bonus dmg
     9:   {'Sustain / Tank': 15},                      # Devotion: def/dmg scaling with prayer pts
@@ -469,10 +422,6 @@ def greedy_build(weights, root, budget, archetype_name=None):
                 continue
             if cost_map[nid] > remaining:
                 continue
-            # Real client rule: valid if root/free-cost, or ANY undirected
-            # neighbor is already selected (selected is always fully valid
-            # here, so this is the same test the live client's incremental
-            # click-handler uses), AND the specialRequirement (if any) passes.
             if not (is_root_map.get(nid) or cost_map.get(nid) == 0):
                 if not any(nb in selected for nb in UNDIRECTED_ADJ.get(nid, ())):
                     continue
@@ -491,25 +440,8 @@ def greedy_build(weights, root, budget, archetype_name=None):
     else:
         return frozenset({root})
 
-# ---------------------------------------------------------------------------
 # ILP solver – no floating nodes (respects overrides)
-#
-# STRUCTURAL FIX: the old formulation only required "at least one of my
-# prerequisites is also selected" (or "all", for keystones). That's too weak:
-# a closed loop of nodes can satisfy each other's requirement without ever
-# tracing back to the actual root (e.g. A needs B, B needs C, C needs A).
-# We saw this happen for real, repeatedly, on the live data (102/103/218/244,
-# 205/279, 178/230/179/247, ...) — patching each one by hand as it's found
-# doesn't scale.
-#
-# The fix is a rank/ordering constraint, the same trick used to eliminate
-# subtours in TSP formulations (MTZ constraints): every candidate node gets
-# an integer rank r[nid]. The root is rank 0. Whenever a node is selected via
-# a specific justifying prerequisite edge, its rank must be strictly greater
-# than that prerequisite's rank. A cycle would require strictly increasing
-# ranks all the way around back to the start, which is impossible — so the
-# ILP can no longer "bootstrap" a selection purely from a loop.
-# ---------------------------------------------------------------------------
+
 def solve_archetype(weights, root, budget, prev_solution=None, fallback_log=None, archetype_name=None):
     candidate_nodes = [nid for nid in ALL_NODE_IDS if cost_map[nid] <= budget]
     node_marginal_score = precompute_marginal_scores(weights, archetype_name)
@@ -542,16 +474,10 @@ def solve_archetype(weights, root, budget, prev_solution=None, fallback_log=None
         if is_root_map.get(nid):
             continue  # other roots already forced to x==0 above
         if cost_map.get(nid) == 0:
-            # Real client rule: pointCost==0 nodes are always valid regardless
-            # of connectivity. No gating constraint at all — only the shared
-            # budget constraint above applies.
             continue
 
         sr = special_map.get(nid)
         if sr == 'perkgraph:all_links_unlocked':
-            # Real rule for capstones: ALL of the node's own DIRECT
-            # prerequisites must be selected (not the full ancestor tree,
-            # and not "any neighbor" — this is the one real AND case).
             pre = prereq.get(nid, [])
             if not pre:
                 continue  # trivially satisfied per the real client logic
@@ -599,17 +525,7 @@ def solve_archetype(weights, root, budget, prev_solution=None, fallback_log=None
         greedy = greedy_build(weights, root, budget, archetype_name)
         score = sum(node_marginal_score[nid] for nid in greedy)
         return greedy, score, True
-
-# ---------------------------------------------------------------------------
-# Parallel solving — every (archetype, root, budget) combo is fully
-# independent, so this is embarrassingly parallel across CPU cores. A GPU
-# does NOT help here: CBC's branch-and-bound is inherently sequential per
-# problem (no mature GPU MIP solver is in general use), so the real lever
-# for speed on better hardware is core count, not GPU compute. Bumped the
-# optimality gap back down to 0.01 (from the emergency 0.05 used only to
-# survive tight interactive tool-call time limits) since with real
-# parallelism there's no need to trade quality for speed anymore.
-# ---------------------------------------------------------------------------
+      
 def _solve_task(task):
     archetype_name, root, budget = task
     weights = ARCHETYPE_WEIGHTS[archetype_name]
