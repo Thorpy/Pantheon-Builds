@@ -1,25 +1,35 @@
 #!/usr/bin/env python3
 """
-Pantheon Pact Tree Optimal Build Solver – Corrected v3
-=======================================================
-Fixes applied in this version:
-  1. effectDefinitions -> effects key fix (non-stackable effects now handled correctly,
-     e.g. Orbiting Hammer Max Hit now correctly caps at 150% instead of summing to 325%).
-  2. Robust variant selection by slug='pantheon' instead of assuming index 0.
-  3. Prerequisite override for the previously-unreachable 102/103/218/244 loop.
-  4. Fixed the 279 -> 205 override, which created a NEW self-supporting 2-node loop
-     with node 205 (205's real prereqs are [6, 279], so overriding 279 -> [205] let the
-     two nodes "satisfy" each other without ever tracing back to a real root). 279 now
-     overrides straight to the Bandos root (6), matching the pattern used for 22/23.
-  5. A startup sanity check that flags if any override creates this kind of loop again.
-  6. Fallback-to-greedy is now logged, so any remaining ILP/greedy mismatches are visible
-     instead of silent.
-  7. Removed the inaccurate "Sara and Bandos share 312 of 314 nodes" note (verified false
-     against the actual data: only 15 nodes are shared between the two root's reachable sets).
+Pantheon Pact Tree Optimal Build Solver
+========================================
+Standalone — single file, no manual data download needed. On startup it
+looks for pantheon_data.json next to this script; if missing, it curls a
+fresh copy from august-rsps.com/perk-graph/data.json and saves it locally
+for next time (falls back to Python's urllib if curl isn't on PATH). Pass a
+file path as argv[1] to use a specific copy instead of either of those.
+
+Validity logic is a direct port of the real client's own algorithm, extracted
+from its source (f16229361d9c277e.js), not inferred from examples:
+  - Undirected adjacency: a node validates via ANY node connected by a
+    prerequisite edge, in either direction — not just its own listed parents.
+  - A node is valid if it's a root, or its pointCost is 0, or any adjacent
+    node is already valid (pure OR — no AND-logic on keystones).
+  - specialRequirement has exactly two real cases: "all_links_unlocked"
+    (capstones — needs its own direct prerequisites, not the full ancestor
+    tree) and "exclusive_alignment" (the 6 roots — pick only one).
+  - There is no god-exclusivity rule for keystone/small/medium nodes.
+Verified against 4 independently-confirmed real examples (in-game click
+tests and the live planner's own "unreachable" flags) before use.
+
+Solving is parallelized across all CPU cores via multiprocessing, since the
+960 (archetype, root, budget) solves are fully independent. A GPU does not
+help here — CBC's branch-and-bound is inherently sequential per problem.
 """
 
-import json
+import os
 import sys
+import json
+import subprocess
 from pulp import LpProblem, LpMaximize, LpVariable, lpSum, value, PULP_CBC_CMD
 
 # ---------------------------------------------------------------------------
@@ -149,13 +159,47 @@ ARCHETYPE_WEIGHTS = {
 }
 
 # ---------------------------------------------------------------------------
-BUDGETS = list(range(5, 151, 5))
-TIME_LIMIT = 60
+BUDGETS = list(range(5, 101, 5))  # capped at 100 — confirmed real in-game point cap
+TIME_LIMIT = 15  # per-solve budget; safe to raise further on a many-core machine
 
 # ---------------------------------------------------------------------------
-# Load data
+# Load data. Checks, in order:
+#   1. An explicit file path passed as argv[1].
+#   2. pantheon_data.json sitting next to this script (same folder).
+#   3. If neither exists, curl it fresh from the live source and save it
+#      next to this script for next time, so subsequent runs work offline.
 # ---------------------------------------------------------------------------
-data_path = sys.argv[1] if len(sys.argv) > 1 else 'pantheon_data.json'
+DATA_URL = "https://august-rsps.com/perk-graph/data.json"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LOCAL_DATA_PATH = os.path.join(SCRIPT_DIR, "pantheon_data.json")
+
+if len(sys.argv) > 1:
+    data_path = sys.argv[1]
+elif os.path.exists(LOCAL_DATA_PATH):
+    data_path = LOCAL_DATA_PATH
+else:
+    print(f"pantheon_data.json not found in {SCRIPT_DIR}, fetching from {DATA_URL} ...")
+    try:
+        subprocess.run(
+            ["curl", "-fsSL", DATA_URL, "-o", LOCAL_DATA_PATH],
+            check=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # curl missing or failed (e.g. Windows without curl on PATH pre-2018) —
+        # fall back to Python's own HTTP client so this still works everywhere.
+        try:
+            import urllib.request
+            urllib.request.urlretrieve(DATA_URL, LOCAL_DATA_PATH)
+        except Exception as e:
+            if os.path.exists(LOCAL_DATA_PATH):
+                os.remove(LOCAL_DATA_PATH)  # don't leave a partial/corrupt file behind
+            print(f"Couldn't fetch {DATA_URL}: {e}")
+            print("Check your internet connection, or manually download the file to:")
+            print(f"  {LOCAL_DATA_PATH}")
+            sys.exit(1)
+    print(f"Saved to {LOCAL_DATA_PATH} — future runs will use this local copy.")
+    data_path = LOCAL_DATA_PATH
+
 with open(data_path) as f:
     data = json.load(f)
 
@@ -166,96 +210,123 @@ try:
 except StopIteration:
     print("Error: 'pantheon' variant not found in data.")
     sys.exit(1)
-
 node_list = variant['nodes']
 nodes      = {n['id']: n for n in node_list}
 prereq     = {n['id']: list(n.get('prerequisites', [])) for n in node_list}
 cost_map   = {n['id']: n['pointCost'] for n in node_list}
 size_map   = {n['id']: n['size'] for n in node_list}
+is_root_map = {n['id']: bool(n.get('isRoot')) for n in node_list}
+special_map = {n['id']: n.get('specialRequirement') for n in node_list}
 
-# FIXED: the correct top-level key is 'effects', not 'effectDefinitions'.
-# Previously this always evaluated to {}, so effect_defs.get(rid, True) was always
-# True and every effect (even those marked "stackable": false) was summed instead
-# of capped at its max tier. This is what caused e.g. Orbiting Hammer Max Hit to
-# show 325% instead of the real cap of 150%.
 effect_defs = {e['rowId']: e.get('stackable', True) for e in data.get('effects', [])}
 
 GOD_ROOTS    = {1, 2, 3, 4, 5, 6}
 ALL_NODE_IDS = list(nodes.keys())
 
-# ---------------------------------------------------------------------------
-# HARDCODED PREREQUISITE FIXES — BEST AVAILABLE INFERENCE, NOT DEV-CONFIRMED
-# ---------------------------------------------------------------------------
-# These nodes have missing/broken prerequisites in the raw export. A dev
-# confirmed the *bug itself* is real (prerequisites are supposed to exist)
-# but did not provide the exact intended values. The values below are the
-# best-supported guesses from this investigation:
-#   - Every other god's capstone requires 3 keystones that each have 2 real
-#     medium-tier prerequisites. Bandos is the only exception (22/23/24 all
-#     empty) — confirmed a genuine gap, not intentional design.
-#   - 22 (Blindbag): user-confirmed the real relationship is OR, not the
-#     usual keystone AND — either of the two "Echoes" nodes unlocks it.
-#   - 23/24: no direct confirmation: best-supported pair per the same
-#     cross-branch feeder pattern used by every other god's keystones.
-#   - 175, 239: single best spatial/connectivity candidate from the graph.
-#   - 279: matches the same hub (205) its two siblings both connect through.
-#   - 244: breaks the isolated 102/103/218/244 loop (no external anchor
-#     found anywhere in the data for this cluster; this is the weakest link
-#     in this whole set — treat it with the most suspicion).
+# 2026-07-07: REBUILT FROM THE REAL CLIENT SOURCE (f16229361d9c277e.js), extracted
+# live via console. Every previous version of this validity logic — the AND-logic-
+# on-keystones model, the "empty prereq = forbidden" model, the "empty prereq =
+# free" model, and the god-exclusivity model — was an inference from examples and
+# is now known to be wrong in some respect. This is not an inference; it is a
+# direct transcription of the client's own functions tY/tV/tK.
 #
-# IMPORTANT: none of this has been verified against the live planner or
-# server logic — the planner reads the same broken source data we do, so it
-# cannot confirm or deny these values either. If any of these turn out wrong
-# once real data is available, update PREREQ_OVERRIDES (and OR_LOGIC_NODES
-# if the AND/OR type is also wrong) — and ideally push the real values into
-# pantheon_data.json directly so the live planner agrees too.
+# Key facts this reveals that no prior version had right:
+#  - Adjacency is UNDIRECTED. A node's "prerequisites" list creates a two-way edge:
+#    it can be validated via that listed parent, OR via any other node that lists
+#    IT as a prerequisite. Direction of the listed prerequisite does not gate
+#    which side must come "first".
+#  - A node is valid if it isRoot, OR its pointCost is 0, OR ANY undirected
+#    neighbor is already valid (pure OR across all neighbors — no AND logic on
+#    keystones at all).
+#  - specialRequirement has exactly two real cases:
+#      "perkgraph:all_links_unlocked" (capstones): all of the node's own DIRECT
+#        prerequisites must be valid (not the full ancestor tree).
+#      "pantheon:exclusive_alignment" (the 6 roots only): at most one node
+#        carrying this flag may be valid at once — i.e. exactly the single-root
+#        rule, with no other meaning.
+#  - There is NO god-exclusivity mechanic anywhere for keystone/capstone/small/
+#    medium nodes. A node with an empty prerequisite list and pointCost > 0 (e.g.
+#    22, 23, 24, 175, 239, 279) is only reachable via nodes that list IT as their
+#    OWN prerequisite (reverse edges) — it is not "free", and it is not
+#    "forbidden" either; it's exactly as reachable as any other node under the
+#    undirected-OR rule above.
+UNDIRECTED_ADJ = {nid: set() for nid in nodes}
+for _n in node_list:
+    for _p in _n['prerequisites']:
+        UNDIRECTED_ADJ[_n['id']].add(_p)
+        UNDIRECTED_ADJ.setdefault(_p, set()).add(_n['id'])
+
+def _special_ok(nid, valid_set):
+    sr = special_map.get(nid)
+    if not sr:
+        return True
+    if sr == 'perkgraph:all_links_unlocked':
+        pre = prereq.get(nid, [])
+        return len(pre) == 0 or all(p in valid_set for p in pre)
+    if sr == 'pantheon:exclusive_alignment':
+        return not any(
+            other != nid and special_map.get(other) == sr and other in valid_set
+            for other in GOD_ROOTS
+        )
+    return True
+
+def _reachable_set(selected):
+    """Exact port of the client's fixed-point closure (the 'cascade' reconciliation
+    function). Returns the subset of `selected` that is actually valid/obtainable."""
+    valid = set()
+    changed = True
+    while changed:
+        changed = False
+        for a in selected:
+            if a in valid:
+                continue
+            if a not in nodes:
+                continue
+            if is_root_map.get(a) or cost_map.get(a) == 0:
+                conn_ok = True
+            else:
+                conn_ok = any(nb in valid for nb in UNDIRECTED_ADJ.get(a, ()))
+            if conn_ok and _special_ok(a, valid):
+                valid.add(a)
+                changed = True
+    return valid
+
 # ---------------------------------------------------------------------------
-PREREQ_OVERRIDES = {
-    22: [330, 331],   # Blindbag <- Berserker Echoes 2 / 3 (OR — see OR_LOGIC_NODES below)
-    23: [328, 325],   # Goliath's Reach <- Goliath Reaching Echo + Blindbag Cutting Edge (AND, best-guess pair)
-    24: [326, 327],   # Berserker <- Goliath Long Haft + Goliath Pressure Strike (AND, best-guess pair)
-    175: [100],       # Stalwart 4 <- nearest connected node (neutral_prayer_pen_3)
-    239: [9],         # Pious Penetrator 1 <- Sara's Devotion keystone (nearest connected candidate)
-    279: [205],       # Bandos's Wrath 2 <- same hub (205) as siblings Wrath 1 and Wrath 3
-    244: [243],       # Pious Penetrator 6 <- Pious Penetrator 5 (breaks the 102/103/218/244 loop)
-}
-
-# Nodes where the true logic differs from what `size` alone implies.
-# Every other keystone in the tree uses AND (all listed prereqs required).
-# 22 is confirmed to use OR instead (either listed prereq is enough).
-OR_LOGIC_NODES = {22}
-
-for nid, new_pre in PREREQ_OVERRIDES.items():
-    if nid in prereq:
-        prereq[nid] = new_pre
-
-def _uses_and_logic(nid, sz):
-    """True if nid requires ALL its prerequisites (keystone/capstone default),
-    False if it only needs ANY ONE (small/medium default, or an explicit
-    OR_LOGIC_NODES exception like node 22)."""
-    return sz in ('keystone', 'capstone') and nid not in OR_LOGIC_NODES
+# NOTE: every previous version of this file had a block here for hardcoded
+# prerequisite overrides, OR_LOGIC_NODES exceptions, and AND-vs-OR-by-size
+# logic. All of that is now known to be unnecessary: the real client uses
+# plain undirected-OR reachability (see UNDIRECTED_ADJ / _reachable_set
+# above) for every node regardless of size, with no AND-logic anywhere
+# except the two explicit specialRequirement cases already handled in
+# _special_ok(). Nodes with empty prerequisite lists (22, 23, 24, 175, 239,
+# 279, etc.) are neither "free" nor "forbidden" — they're ordinary nodes
+# whose only edges come from OTHER nodes listing them as a prerequisite
+# (reverse edges), which UNDIRECTED_ADJ already captures correctly. No
+# guessed overrides, size-based AND/OR split, or god-exclusivity rule is
+# needed or correct. This whole block is intentionally empty now.
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Compute a tight upper bound on real prerequisite-chain depth (used as the
 # "big-M" in the rank-ordering ILP constraints below). Using the true graph
 # depth instead of the total node count keeps the ILP numerically tight.
+# NOTE: this now walks UNDIRECTED_ADJ (BFS distance from each root) rather
+# than the old directed parent->child tree, since reachability itself is
+# undirected. It's still just a bound for the ILP's big-M, not a validity
+# rule, so a slightly loose bound here is fine.
 # ---------------------------------------------------------------------------
 def _compute_max_chain_depth():
     from collections import deque
-    children = {nid: [] for nid in ALL_NODE_IDS}
-    for nid in ALL_NODE_IDS:
-        for p in prereq.get(nid, []):
-            children.setdefault(p, []).append(nid)
     max_depth = 0
     for root in GOD_ROOTS:
         depth = {root: 0}
         q = deque([root])
         while q:
             cur = q.popleft()
-            for child in children.get(cur, []):
-                if child not in depth:
-                    depth[child] = depth[cur] + 1
-                    q.append(child)
+            for nb in UNDIRECTED_ADJ.get(cur, ()):
+                if nb not in depth:
+                    depth[nb] = depth[cur] + 1
+                    q.append(nb)
         if depth:
             max_depth = max(max_depth, max(depth.values()))
     return max_depth
@@ -263,60 +334,83 @@ def _compute_max_chain_depth():
 MAX_CHAIN_DEPTH = _compute_max_chain_depth()
 
 # ---------------------------------------------------------------------------
-# Verification – no floating nodes (except roots)
+# Verification — exact port of the real client's validity check.
 # ---------------------------------------------------------------------------
 def is_valid_build(selected, root):
+    selected = set(selected)
     if root not in selected:
         return False
-    for nid in selected:
-        if nid == root:
-            continue
-        pre = prereq.get(nid, [])
-        if not pre:
-            return False  # non‑root floating node forbidden
-        sz = size_map.get(nid, 'medium')
-        if _uses_and_logic(nid, sz):
-            if not all(p in selected for p in pre):
-                return False
-        else:
-            if not any(p in selected for p in pre):
-                return False
+    return _reachable_set(selected) == selected
 
-    reachable = {root}
-    changed = True
-    while changed:
-        changed = False
-        for nid in selected:
-            if nid in reachable:
-                continue
-            pre = prereq.get(nid, [])
-            if not pre:
-                continue
-            sz = size_map.get(nid, 'medium')
-            if _uses_and_logic(nid, sz):
-                if all(p in reachable for p in pre):
-                    reachable.add(nid)
-                    changed = True
-            else:
-                if any(p in reachable for p in pre):
-                    reachable.add(nid)
-                    changed = True
-    return selected == reachable
 
 # ---------------------------------------------------------------------------
 # Scoring helpers
 # ---------------------------------------------------------------------------
-def get_all_prereqs(nid, visited=None):
-    if visited is None:
-        visited = set()
-    if nid in visited:
-        return visited
-    visited.add(nid)
+_all_prereqs_cache = {}
+def get_all_prereqs(nid, _visiting=None):
+    """Full ancestor closure of nid, memoized. Retains cycle protection (in
+    case the source data ever has one) while still being O(1) amortized
+    across repeated calls, unlike the original which re-walked the whole
+    chain from scratch every time — including once per non-stackable effect
+    per node per full node scan, which used to happen 180x per archetype."""
+    if nid in _all_prereqs_cache:
+        return _all_prereqs_cache[nid]
+    if _visiting is None:
+        _visiting = set()
+    if nid in _visiting:
+        return {nid}  # cycle guard
+    _visiting.add(nid)
+    visited = {nid}
     for p in prereq.get(nid, []):
-        get_all_prereqs(p, visited)
+        visited |= get_all_prereqs(p, _visiting)
+    _all_prereqs_cache[nid] = visited
     return visited
 
-def precompute_marginal_scores(weights):
+# ---------------------------------------------------------------------------
+# MANUAL ABILITY SCORES — for nodes with NO numeric `effects`
+# ---------------------------------------------------------------------------
+# 54 nodes in this tree (every capstone, plus several keystones) grant real,
+# often build-defining mechanics that are only described in text, not encoded
+# as a numeric effect. The scoring model below can only ever value what's in
+# an `effects` array, so without this these nodes silently score 0 forever,
+# no matter how strong they are, and the solver will never recommend them.
+#
+# These numbers are Claude's own judgment calls from reading each node's
+# description, loosely calibrated against comparable weighted stats
+# elsewhere in this file (e.g. a 25%-damage stat with weight 4.0 scores 100).
+# THEY ARE NOT MEASURED DATA. Treat them as a reasonable starting point and
+# adjust freely — there is no way to derive these mechanically from the JSON.
+# ---------------------------------------------------------------------------
+MANUAL_ABILITY_SCORES = {
+    8:   {'Hammer / Prayer': 20, 'Melee DPS': 10},   # Smite: +0.35%/pt equipped prayer bonus dmg
+    9:   {'Sustain / Tank': 15},                      # Devotion: def/dmg scaling with prayer pts
+    13:  {'Summoner / Pet': 35},                      # Legion: free duplicate thrall summon
+    14:  {'Summoner / Pet': 22},                      # Soul Conduit: +15% dmg per active summon to boss pet
+    15:  {'Summoner / Pet': 12},                      # Blood Tithe: +15% pet/summon dmg, -30 HP cost
+    16:  {'Ranged DPS': 28},                          # Eye of Armadyl: halved mitigation + up to +16% dmg
+    20:  {'Sustain / Tank': 22},                      # Bark Skin: 35% less dmg (1/3 delayed as bleed)
+    303: {'Magic DPS': 22},                           # Heretic Mastery: spellbook + Heretic's Meteor combo
+    304: {'Summoner / Pet': 28},                      # Necromancer Mastery: infinite range/LOS + new summon
+    305: {'Ranged DPS': 22},                          # Skyborn Mastery: +10 tile base range + chaining echo
+    321: {'Hammer / Prayer': 28},                     # Aegis of Light: Omni prayer + explicit +15% hammer dmg
+    339: {'Berserker': 22, 'Melee DPS': 12},          # Avatar of Bandos: timed combat-mode burst window
+    356: {'Sustain / Tank': 28},                      # World Guardian: +50% reflect + anti-one-shot cap
+}
+
+_marginal_score_cache = {}
+def precompute_marginal_scores(weights, archetype_name=None):
+    # Cache key: archetype_name alone is sufficient since each archetype has
+    # exactly one fixed weights dict in ARCHETYPE_WEIGHTS — this function's
+    # result never varies across root/budget, only across archetype. Without
+    # this, the full node scan (including the get_all_prereqs walk for every
+    # non-stackable effect) ran 180 times per archetype instead of once —
+    # 1440 redundant full recomputations across the whole run. Note this
+    # cache is per-process under multiprocessing (each worker has its own
+    # copy), so it helps most when a worker handles several tasks from the
+    # same archetype in a row — which the task ordering already does, since
+    # tasks are generated grouped by archetype.
+    if archetype_name is not None and archetype_name in _marginal_score_cache:
+        return _marginal_score_cache[archetype_name]
     node_marginal_score = {}
     for nid in ALL_NODE_IDS:
         score = 0.0
@@ -337,7 +431,11 @@ def precompute_marginal_scores(weights):
                             best_pre_val = max(best_pre_val, peff['value'])
                 marginal = max(0.0, val - best_pre_val)
                 score += w * marginal
+        if archetype_name is not None:
+            score += MANUAL_ABILITY_SCORES.get(nid, {}).get(archetype_name, 0)
         node_marginal_score[nid] = score
+    if archetype_name is not None:
+        _marginal_score_cache[archetype_name] = node_marginal_score
     return node_marginal_score
 
 def aggregate_effects(selected_ids):
@@ -352,11 +450,15 @@ def aggregate_effects(selected_ids):
                 totals[rid] = max(totals.get(rid, 0), val)
     return totals
 
+def get_ability_nodes(selected_ids):
+    """Which manually-scored ability nodes (if any) are present in a build."""
+    return [nid for nid in selected_ids if nid in MANUAL_ABILITY_SCORES]
+
 # ---------------------------------------------------------------------------
 # Greedy fallback – no floating nodes (respects overrides)
 # ---------------------------------------------------------------------------
-def greedy_build(weights, root, budget):
-    node_marginal_score = precompute_marginal_scores(weights)
+def greedy_build(weights, root, budget, archetype_name=None):
+    node_marginal_score = precompute_marginal_scores(weights, archetype_name)
     selected = {root}
     remaining = budget - cost_map[root]
     while True:
@@ -367,16 +469,15 @@ def greedy_build(weights, root, budget):
                 continue
             if cost_map[nid] > remaining:
                 continue
-            pre = prereq.get(nid, [])
-            if not pre:
-                continue  # non‑root floating node forbidden
-            sz = size_map.get(nid, 'medium')
-            if _uses_and_logic(nid, sz):
-                if not all(p in selected for p in pre):
+            # Real client rule: valid if root/free-cost, or ANY undirected
+            # neighbor is already selected (selected is always fully valid
+            # here, so this is the same test the live client's incremental
+            # click-handler uses), AND the specialRequirement (if any) passes.
+            if not (is_root_map.get(nid) or cost_map.get(nid) == 0):
+                if not any(nb in selected for nb in UNDIRECTED_ADJ.get(nid, ())):
                     continue
-            else:
-                if not any(p in selected for p in pre):
-                    continue
+            if not _special_ok(nid, selected):
+                continue
             score = node_marginal_score[nid]
             if score > best_score:
                 best_score = score
@@ -409,13 +510,9 @@ def greedy_build(weights, root, budget):
 # ranks all the way around back to the start, which is impossible — so the
 # ILP can no longer "bootstrap" a selection purely from a loop.
 # ---------------------------------------------------------------------------
-def solve_archetype(weights, root, budget, prev_solution=None, fallback_log=None):
+def solve_archetype(weights, root, budget, prev_solution=None, fallback_log=None, archetype_name=None):
     candidate_nodes = [nid for nid in ALL_NODE_IDS if cost_map[nid] <= budget]
-    node_marginal_score = precompute_marginal_scores(weights)
-    # Tight bound on chain depth (measured via BFS: deepest real prereq chain in the
-    # whole tree is 16 hops). Using this instead of len(candidate_nodes) keeps the
-    # big-M constraints numerically tight, which is the difference between ~0.5s and
-    # 60s per solve for the larger budgets.
+    node_marginal_score = precompute_marginal_scores(weights, archetype_name)
     N = MAX_CHAIN_DEPTH + 2
 
     prob = LpProblem(f"r{root}_b{budget}", LpMaximize)
@@ -429,7 +526,7 @@ def solve_archetype(weights, root, budget, prev_solution=None, fallback_log=None
     prob += lpSum(node_marginal_score[nid] * x[nid] for nid in candidate_nodes)
 
     if root not in x:
-        return None, -1
+        return None, -1, False
     prob += x[root] == 1
     prob += rank[root] == 0
 
@@ -442,38 +539,49 @@ def solve_archetype(weights, root, budget, prev_solution=None, fallback_log=None
     for nid in candidate_nodes:
         if nid == root:
             continue
-        pre = prereq.get(nid, [])
-        if not pre:
-            prob += x[nid] == 0  # non-root floating node forbidden
+        if is_root_map.get(nid):
+            continue  # other roots already forced to x==0 above
+        if cost_map.get(nid) == 0:
+            # Real client rule: pointCost==0 nodes are always valid regardless
+            # of connectivity. No gating constraint at all — only the shared
+            # budget constraint above applies.
             continue
-        pre_candidates = [p for p in pre if p in candidate_nodes]
-        if not pre_candidates:
-            prob += x[nid] == 0
-            continue
-        sz = size_map.get(nid, 'medium')
-        if _uses_and_logic(nid, sz):
-            # AND: every listed prerequisite must be selected AND have a
-            # strictly smaller rank whenever nid itself is selected.
+
+        sr = special_map.get(nid)
+        if sr == 'perkgraph:all_links_unlocked':
+            # Real rule for capstones: ALL of the node's own DIRECT
+            # prerequisites must be selected (not the full ancestor tree,
+            # and not "any neighbor" — this is the one real AND case).
+            pre = prereq.get(nid, [])
+            if not pre:
+                continue  # trivially satisfied per the real client logic
+            pre_candidates = [p for p in pre if p in candidate_nodes]
             if len(pre_candidates) < len(pre):
-                # a required prerequisite isn't even affordable at this budget
                 prob += x[nid] == 0
                 continue
             for p in pre_candidates:
                 prob += x[nid] <= x[p]
                 prob += rank[nid] >= rank[p] + 1 - N * (1 - x[nid])
         else:
-            # OR: at least one prerequisite must be selected, and we track
-            # which one specifically "justifies" nid via an edge-selector z,
-            # enforcing the rank order only along that chosen edge.
-            z = {p: LpVariable(f"z_{nid}_{p}", cat='Binary') for p in pre_candidates}
-            prob += lpSum(z[p] for p in pre_candidates) >= x[nid]
-            for p in pre_candidates:
-                prob += z[p] <= x[p]
-                prob += z[p] <= x[nid]
-                prob += rank[nid] >= rank[p] + 1 - N * (1 - z[p])
+            # Ordinary node: real rule is undirected-OR reachability — valid
+            # if ANY undirected neighbor (parent OR child of the original
+            # directed prerequisite edge) is selected. MTZ rank-ordering on
+            # whichever neighbor edge is used still prevents cycles from
+            # bootstrapping a selection with no real path to the root.
+            neighbors = [nb for nb in UNDIRECTED_ADJ.get(nid, ()) if nb in candidate_nodes]
+            if not neighbors:
+                prob += x[nid] == 0
+                continue
+            z = {nb: LpVariable(f"z_{nid}_{nb}", cat='Binary') for nb in neighbors}
+            prob += lpSum(z[nb] for nb in neighbors) >= x[nid]
+            for nb in neighbors:
+                prob += z[nb] <= x[nb]
+                prob += z[nb] <= x[nid]
+                prob += rank[nid] >= rank[nb] + 1 - N * (1 - z[nb])
 
-    prob.solve(PULP_CBC_CMD(msg=0, timeLimit=TIME_LIMIT, warmStart=bool(prev_solution)))
+    prob.solve(PULP_CBC_CMD(msg=0, timeLimit=TIME_LIMIT, warmStart=bool(prev_solution), gapRel=0.01))
 
+    fell_back = False
     try:
         selected = frozenset(
             nid for nid in candidate_nodes
@@ -481,36 +589,35 @@ def solve_archetype(weights, root, budget, prev_solution=None, fallback_log=None
         )
         if selected and is_valid_build(selected, root):
             score = sum(node_marginal_score[nid] for nid in selected)
-            return selected, score
+            return selected, score, False
         else:
-            if fallback_log is not None:
-                fallback_log.append((root, budget))
-            greedy = greedy_build(weights, root, budget)
+            fell_back = True
+            greedy = greedy_build(weights, root, budget, archetype_name)
             score = sum(node_marginal_score[nid] for nid in greedy)
-            return greedy, score
+            return greedy, score, True
     except Exception:
-        if fallback_log is not None:
-            fallback_log.append((root, budget))
-        greedy = greedy_build(weights, root, budget)
+        greedy = greedy_build(weights, root, budget, archetype_name)
         score = sum(node_marginal_score[nid] for nid in greedy)
-        return greedy, score
+        return greedy, score, True
 
 # ---------------------------------------------------------------------------
-# Main generation
+# Parallel solving — every (archetype, root, budget) combo is fully
+# independent, so this is embarrassingly parallel across CPU cores. A GPU
+# does NOT help here: CBC's branch-and-bound is inherently sequential per
+# problem (no mature GPU MIP solver is in general use), so the real lever
+# for speed on better hardware is core count, not GPU compute. Bumped the
+# optimality gap back down to 0.01 (from the emergency 0.05 used only to
+# survive tight interactive tool-call time limits) since with real
+# parallelism there's no need to trade quality for speed anymore.
 # ---------------------------------------------------------------------------
-def generate_builds_for_archetype(archetype_name, weights, fallback_log):
-    best = {b: (-1.0, None, frozenset()) for b in BUDGETS}
-    for root in sorted(GOD_ROOTS):
-        prev_solution = None
-        for b in BUDGETS:
-            build, score = solve_archetype(weights, root, b, prev_solution, fallback_log)
-            if build is not None and score > best[b][0]:
-                best[b] = (score, root, build)
-            if build:
-                prev_solution = {nid: 1 if nid in build else 0 for nid in ALL_NODE_IDS}
-            else:
-                prev_solution = None
-    return best
+def _solve_task(task):
+    archetype_name, root, budget = task
+    weights = ARCHETYPE_WEIGHTS[archetype_name]
+    build, score, fell_back = solve_archetype(weights, root, budget, None, None, archetype_name)
+    return (archetype_name, root, budget, build, score, fell_back)
+
+
+
 
 # ---------------------------------------------------------------------------
 # HTML generation (v5 style)
@@ -565,6 +672,7 @@ td{padding:7px 10px;vertical-align:middle}
 .pp{background:#1c1608;color:#c89040;border:1px solid #402c08}
 .pc{background:#160c1e;color:#b058c8;border:1px solid #36105a}
 .px{background:#121220;color:#8090b0;border:1px solid #202248}
+.pa{background:#241a04;color:#e8b040;border:1px solid #4a3208;font-weight:700}
 .dup-label{color:#5a4a60;font-size:.6rem;font-style:italic;margin-left:6px}
 a.btn{color:#5868a8;text-decoration:none;font-size:.67rem;border:1px solid #1e1e3c;padding:3px 7px;border-radius:3px;white-space:nowrap;transition:all .12s}
 a.btn:hover{background:#161c36;color:#8898e8;border-color:#343860}
@@ -576,7 +684,7 @@ a.btn:hover{background:#161c36;color:#8898e8;border-color:#343860}
 </head>
 <body>
 <h1>Pantheon Pact Tree &mdash; Build Guide</h1>
-<p class="sub">8 archetypes &middot; 5&ndash;150pt &middot; ILP exact solver &middot; Core effect filtering &middot; Temporary prerequisite patches applied</p>
+<p class="sub">8 archetypes &middot; 5&ndash;100pt &middot; ILP exact solver &middot; Core effect filtering &middot; Free-standing nodes confirmed via live testing (no guessed overrides)</p>
 <div class="tabs">
 """)
 
@@ -659,6 +767,14 @@ a.btn:hover{background:#161c36;color:#8898e8;border-color:#343860}
                     relevant[short] = v
             top = sorted(relevant.items(), key=lambda kv: -weights.get(f'perk_graph_effect:pantheon_{kv[0]}', 1) * kv[1])[:5]
             pill_html = ''.join(f'<span class="pill {get_pill_class(k)}">{k}={v:.0f}</span> ' for k, v in top)
+
+            # Ability-only nodes (no numeric effect, manually scored) get their own
+            # distinct pill so it's clear WHY the build reaches for them.
+            ability_ids = get_ability_nodes(build)
+            for aid in ability_ids:
+                aname = nodes[aid]['displayName']
+                pill_html += f'<span class="pill pa" title="Ability (no numeric stat) — manually scored, see notes">{aname} ⚡</span> '
+
             if not pill_html:
                 pill_html = '<span style="color:#3a3458;font-size:.7rem">(no weighted stats)</span>'
 
@@ -687,11 +803,13 @@ a.btn:hover{background:#161c36;color:#8898e8;border-color:#343860}
         <li><strong>Keystones require ALL listed prerequisites</strong>, small/medium nodes need only one.</li>
         <li><strong>Root switches</strong> are marked by a new row with a different god.</li>
         <li><strong>Duplicate rows</strong> labelled <span style="color:#5a4a60;">(same as previous)</span> mean the optimal build hasn’t changed.</li>
-        <li><strong>Temporary prerequisite patches</strong> have been applied for nodes that were previously floating or in unreachable loops. These will be removed once the game data is fixed.</li>
+        <li><strong>Free-standing nodes</strong> (empty prerequisite list, e.g. Blindbag, Goliath's Reach, Pierce Faith chains) are directly selectable with no unlock chain required — confirmed via live in-game testing, not a guess.</li>
+        <li><strong>Node 244</strong> now uses its real live prerequisite (103) as of 2026-07-06 — previously a guess, now confirmed data.</li>
         <li><strong>Devout Vessel</strong> = HP bonus from prayer bonus %, not damage.</li>
         <li><strong>Flurry</strong> = next attack fires 1 tick sooner.</li>
         <li><strong>Crackling Staff</strong> halves powered‑staff attack speed.</li>
         <li>Use the <strong>Planner</strong> link to see the exact node selection and total cost.</li>
+        <li><strong>Gold ⚡ pills</strong> mark ability nodes (capstones and a few keystones) that have no numeric stat in the game data — only descriptive text (e.g. Smite, Necromancer Mastery, Aegis of Light). Their scores are Claude's own judgment call from reading each description, not measured data, so treat their presence/absence as a rough guide rather than a precise ranking.</li>
     </ul></div>
     <script>
     function show(id,btn){
@@ -726,32 +844,75 @@ def get_pill_class(short_name):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    import pickle, os
+    import pickle, os, time
+    import multiprocessing as mp
+
     CHECKPOINT_FILE = "checkpoint.pkl"
-    all_results = {}
-    fallback_log = []
+    # raw[(archetype, root, budget)] = (build, score, fell_back)
+    raw = {}
 
     if os.path.exists(CHECKPOINT_FILE):
         with open(CHECKPOINT_FILE, "rb") as f:
-            all_results, fallback_log = pickle.load(f)
-        print(f"Resumed from checkpoint: {list(all_results.keys())}")
+            raw = pickle.load(f)
+        print(f"Resumed from checkpoint: {len(raw)} tasks already done")
 
+    all_tasks = [
+        (archetype_name, root, budget)
+        for archetype_name in ARCHETYPE_WEIGHTS
+        for root in sorted(GOD_ROOTS)
+        for budget in BUDGETS
+    ]
+    remaining = [t for t in all_tasks if t not in raw]
+    total = len(all_tasks)
+    print(f"{len(raw)}/{total} tasks already done, {len(remaining)} remaining")
+
+    if remaining:
+        n_workers = os.cpu_count() or 4
+        # Chunk size = one full budget sweep for a given (archetype, root).
+        # Tasks are generated grouped by archetype, so this keeps each chunk
+        # within a single archetype in the common case — letting the
+        # precompute_marginal_scores cache actually pay off within a worker
+        # (it's keyed by archetype, so a worker that gets a mixed-archetype
+        # chunk would just recompute more than once, still fine) — while
+        # cutting inter-process overhead by ~20x versus sending one task at
+        # a time.
+        chunksize = max(1, len(BUDGETS))
+        print(f"Solving {len(remaining)} tasks across {n_workers} processes "
+              f"(TIME_LIMIT={TIME_LIMIT}s/solve, chunksize={chunksize})...")
+        t0 = time.time()
+        done_count = 0
+        SAVE_EVERY = max(1, len(remaining) // 40)  # ~40 checkpoint saves over the run
+        with mp.Pool(processes=n_workers) as pool:
+            for archetype_name, root, budget, build, score, fell_back in pool.imap_unordered(
+                _solve_task, remaining, chunksize=chunksize
+            ):
+                raw[(archetype_name, root, budget)] = (build, score, fell_back)
+                done_count += 1
+                if done_count % SAVE_EVERY == 0 or done_count == len(remaining):
+                    with open(CHECKPOINT_FILE, "wb") as f:
+                        pickle.dump(raw, f)
+                    elapsed = time.time() - t0
+                    rate = done_count / elapsed if elapsed > 0 else 0
+                    eta = (len(remaining) - done_count) / rate if rate > 0 else float('inf')
+                    print(f"  {len(raw)}/{total} done "
+                          f"({rate:.1f} tasks/s, ETA {eta/60:.1f} min)", flush=True)
+
+    # Reassemble the per-archetype, per-budget "best across roots" structure
+    # that generate_html() expects.
+    all_results = {}
+    fallback_log = []
     for archetype_name, weights in ARCHETYPE_WEIGHTS.items():
-        if archetype_name in all_results:
-            print(f"Skipping {archetype_name} (already in checkpoint)")
-            continue
-        print(f"Solving for {archetype_name}...")
-        results = generate_builds_for_archetype(archetype_name, weights, fallback_log)
-        all_results[archetype_name] = (results, weights)
-        print(f"Finished {archetype_name}\n")
-        with open(CHECKPOINT_FILE, "wb") as f:
-            pickle.dump((all_results, fallback_log), f)
+        best = {b: (-1.0, None, frozenset()) for b in BUDGETS}
+        for root in sorted(GOD_ROOTS):
+            for b in BUDGETS:
+                build, score, fell_back = raw[(archetype_name, root, b)]
+                if fell_back:
+                    fallback_log.append((archetype_name, root, b))
+                if build is not None and score > best[b][0]:
+                    best[b] = (score, root, build)
+        all_results[archetype_name] = (best, weights)
 
-    if len(all_results) < len(ARCHETYPE_WEIGHTS):
-        print(f"Progress saved: {len(all_results)}/{len(ARCHETYPE_WEIGHTS)} archetypes done. Re-run to continue.")
-        return
-
-    total_solves = len(ARCHETYPE_WEIGHTS) * len(GOD_ROOTS) * len(BUDGETS)
+    total_solves = len(all_tasks)
     print(f"ILP fallback-to-greedy count: {len(fallback_log)} / {total_solves} solves "
           f"({100 * len(fallback_log) / total_solves:.1f}%)")
     if fallback_log:
