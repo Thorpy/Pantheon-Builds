@@ -22,7 +22,8 @@ Verified against 4 independently-confirmed real examples (in-game click
 tests and the live planner's own "unreachable" flags) before use.
 
 Solving is parallelized across all CPU cores via multiprocessing, since the
-960 (archetype, root, budget) solves are fully independent.
+960 (archetype, root, budget) solves are fully independent. A GPU does not
+help here — CBC's branch-and-bound is inherently sequential per problem.
 """
 
 import os
@@ -202,8 +203,6 @@ else:
 with open(data_path) as f:
     data = json.load(f)
 
-# FIXED: select variant by slug, not by assuming index 0 (the file also contains
-# a 'clue_rewards' variant; relying on ordering is fragile).
 try:
     variant = next(v for v in data['variants'] if v['slug'] == 'pantheon')
 except StopIteration:
@@ -221,15 +220,8 @@ effect_defs = {e['rowId']: e.get('stackable', True) for e in data.get('effects',
 
 GOD_ROOTS    = {1, 2, 3, 4, 5, 6}
 ALL_NODE_IDS = list(nodes.keys())
+MIN_POSITIVE_COST = min(c for c in cost_map.values() if c > 0)
 
-# 2026-07-07: REBUILT FROM THE REAL CLIENT SOURCE (f16229361d9c277e.js), extracted
-# live via console. Every previous version of this validity logic — the AND-logic-
-# on-keystones model, the "empty prereq = forbidden" model, the "empty prereq =
-# free" model, and the god-exclusivity model — was an inference from examples and
-# is now known to be wrong in some respect. This is not an inference; it is a
-# direct transcription of the client's own functions tY/tV/tK.
-# (I couldn't work it out so stole logic from august planner once it was fixed.
-#
 UNDIRECTED_ADJ = {nid: set() for nid in nodes}
 for _n in node_list:
     for _p in _n['prerequisites']:
@@ -272,34 +264,7 @@ def _reachable_set(selected):
     return valid
 
 # ---------------------------------------------------------------------------
-# Compute a tight upper bound on real prerequisite-chain depth (used as the
-# "big-M" in the rank-ordering ILP constraints below). Using the true graph
-# depth instead of the total node count keeps the ILP numerically tight.
-# NOTE: this now walks UNDIRECTED_ADJ (BFS distance from each root) rather
-# than the old directed parent->child tree, since reachability itself is
-# undirected. It's still just a bound for the ILP's big-M, not a validity
-# rule, so a slightly loose bound here is fine.
-# ---------------------------------------------------------------------------
 
-def _compute_max_chain_depth():
-    from collections import deque
-    max_depth = 0
-    for root in GOD_ROOTS:
-        depth = {root: 0}
-        q = deque([root])
-        while q:
-            cur = q.popleft()
-            for nb in UNDIRECTED_ADJ.get(cur, ()):
-                if nb not in depth:
-                    depth[nb] = depth[cur] + 1
-                    q.append(nb)
-        if depth:
-            max_depth = max(max_depth, max(depth.values()))
-    return max_depth
-
-MAX_CHAIN_DEPTH = _compute_max_chain_depth()
-
-# ---------------------------------------------------------------------------
 # Verification — exact port of the real client's validity check.
 # ---------------------------------------------------------------------------
 def is_valid_build(selected, root):
@@ -332,7 +297,9 @@ def get_all_prereqs(nid, _visiting=None):
     _all_prereqs_cache[nid] = visited
     return visited
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# MANUAL ABILITY SCORES — for nodes with NO numeric `effects`
+# --------------------------------------------------------------------------
 
 MANUAL_ABILITY_SCORES = {
     8:   {'Hammer / Prayer': 20, 'Melee DPS': 10},   # Smite: +0.35%/pt equipped prayer bonus dmg
@@ -340,6 +307,8 @@ MANUAL_ABILITY_SCORES = {
     13:  {'Summoner / Pet': 35},                      # Legion: free duplicate thrall summon
     14:  {'Summoner / Pet': 22},                      # Soul Conduit: +15% dmg per active summon to boss pet
     15:  {'Summoner / Pet': 12},                      # Blood Tithe: +15% pet/summon dmg, -30 HP cost
+    256: {'Summoner / Pet': 20},                      # Summon Imp: +1 thrall cap, free extra pet (was unscored)
+    257: {'Summoner / Pet': 20},                      # Summon Guardian: +1 thrall cap, free extra pet (was unscored)
     16:  {'Ranged DPS': 28},                          # Eye of Armadyl: halved mitigation + up to +16% dmg
     20:  {'Sustain / Tank': 22},                      # Bark Skin: 35% less dmg (1/3 delayed as bleed)
     303: {'Magic DPS': 22},                           # Heretic Mastery: spellbook + Heretic's Meteor combo
@@ -352,9 +321,6 @@ MANUAL_ABILITY_SCORES = {
 
 _marginal_score_cache = {}
 def precompute_marginal_scores(weights, archetype_name=None):
-    # Cache key: archetype_name alone is sufficient since each archetype has
-    # exactly one fixed weights dict in ARCHETYPE_WEIGHTS — this function's
-    # result never varies across root/budget, only across archetype.
     if archetype_name is not None and archetype_name in _marginal_score_cache:
         return _marginal_score_cache[archetype_name]
     node_marginal_score = {}
@@ -433,20 +399,31 @@ def greedy_build(weights, root, budget, archetype_name=None):
     else:
         return frozenset({root})
 
-# ILP solver – no floating nodes (respects overrides)
-
 def solve_archetype(weights, root, budget, prev_solution=None, fallback_log=None, archetype_name=None):
     candidate_nodes = [nid for nid in ALL_NODE_IDS if cost_map[nid] <= budget]
     node_marginal_score = precompute_marginal_scores(weights, archetype_name)
-    N = MAX_CHAIN_DEPTH + 2
+    N = (budget // MIN_POSITIVE_COST) + 2
 
     prob = LpProblem(f"r{root}_b{budget}", LpMaximize)
     x = {nid: LpVariable(f"x_{nid}", cat='Binary') for nid in candidate_nodes}
     rank = {nid: LpVariable(f"rank_{nid}", lowBound=0, upBound=N, cat='Integer') for nid in candidate_nodes}
 
+    prev_rank = {}
+    prev_parent = {}
     if prev_solution:
+        from collections import deque
+        prev_rank[root] = 0
+        dq = deque([root])
+        while dq:
+            cur = dq.popleft()
+            for nb in UNDIRECTED_ADJ.get(cur, ()):
+                if nb in prev_solution and nb not in prev_rank:
+                    prev_rank[nb] = prev_rank[cur] + 1
+                    prev_parent[nb] = cur
+                    dq.append(nb)
         for nid in candidate_nodes:
-            x[nid].setInitialValue(1 if prev_solution.get(nid, 0) == 1 else 0)
+            x[nid].setInitialValue(1 if nid in prev_solution else 0)
+            rank[nid].setInitialValue(min(prev_rank.get(nid, 0), N))
 
     prob += lpSum(node_marginal_score[nid] * x[nid] for nid in candidate_nodes)
 
@@ -473,7 +450,7 @@ def solve_archetype(weights, root, budget, prev_solution=None, fallback_log=None
         if sr == 'perkgraph:all_links_unlocked':
             pre = prereq.get(nid, [])
             if not pre:
-                continue  # trivially satisfied per the real client logic
+                continue
             pre_candidates = [p for p in pre if p in candidate_nodes]
             if len(pre_candidates) < len(pre):
                 prob += x[nid] == 0
@@ -482,11 +459,6 @@ def solve_archetype(weights, root, budget, prev_solution=None, fallback_log=None
                 prob += x[nid] <= x[p]
                 prob += rank[nid] >= rank[p] + 1 - N * (1 - x[nid])
         else:
-            # Ordinary node: real rule is undirected-OR reachability — valid
-            # if ANY undirected neighbor (parent OR child of the original
-            # directed prerequisite edge) is selected. MTZ rank-ordering on
-            # whichever neighbor edge is used still prevents cycles from
-            # bootstrapping a selection with no real path to the root.
             neighbors = [nb for nb in UNDIRECTED_ADJ.get(nid, ()) if nb in candidate_nodes]
             if not neighbors:
                 prob += x[nid] == 0
@@ -497,6 +469,8 @@ def solve_archetype(weights, root, budget, prev_solution=None, fallback_log=None
                 prob += z[nb] <= x[nb]
                 prob += z[nb] <= x[nid]
                 prob += rank[nid] >= rank[nb] + 1 - N * (1 - z[nb])
+                if prev_solution:
+                    z[nb].setInitialValue(1 if prev_parent.get(nid) == nb else 0)
 
     prob.solve(PULP_CBC_CMD(msg=0, timeLimit=TIME_LIMIT, warmStart=bool(prev_solution), gapRel=0.01))
 
@@ -518,12 +492,27 @@ def solve_archetype(weights, root, budget, prev_solution=None, fallback_log=None
         greedy = greedy_build(weights, root, budget, archetype_name)
         score = sum(node_marginal_score[nid] for nid in greedy)
         return greedy, score, True
-      
-def _solve_task(task):
-    archetype_name, root, budget = task
+
+def _solve_root_sweep(task):
+    """Solve every budget for one (archetype, root), sequentially, chaining
+    each budget's solution as the warm start for the next. Budgets are
+    monotonic (candidate_nodes only grows) so a smaller-budget optimum is
+    always still a valid, near-optimal starting point for the next budget
+    up — this replaces solving all ~20 budgets from a cold start each time,
+    which was the main reason high budgets (80-100) were timing out without
+    even finding a feasible incumbent within TIME_LIMIT."""
+    archetype_name, root = task
     weights = ARCHETYPE_WEIGHTS[archetype_name]
-    build, score, fell_back = solve_archetype(weights, root, budget, None, None, archetype_name)
-    return (archetype_name, root, budget, build, score, fell_back)
+    results = []
+    prev_solution = None
+    for budget in BUDGETS:
+        build, score, fell_back = solve_archetype(
+            weights, root, budget, prev_solution, None, archetype_name
+        )
+        results.append((budget, build, score, fell_back))
+        if build:
+            prev_solution = build
+    return archetype_name, root, results
 
 
 
@@ -561,6 +550,9 @@ tbody tr:nth-child(even){background:#090816}
 tbody tr:hover{background:#161428!important}
 tbody tr.duplicate{background:#181420!important;border-left:3px solid #3a2a40}
 tbody tr.duplicate:hover{background:#1e1830!important}
+tbody tr.no-core{background:#241417!important;border-left:3px solid #7a3030}
+tbody tr.no-core:hover{background:#2c181c!important}
+.core-warn{color:#e08a6a;font-size:.68rem;margin-top:4px;font-weight:600}
 td{padding:7px 10px;vertical-align:middle}
 .col-pts{font-size:.93rem;font-weight:700;color:#e8d89a;text-align:center;white-space:nowrap}
 .col-pts.hi{color:#6ecf80}
@@ -639,7 +631,7 @@ a.btn:hover{background:#161c36;color:#8898e8;border-color:#343860}
             "Slayer / Hybrid": "Balanced all‑styles with slayer helm and prayer penetration."
         }.get(name, "")
         req_effects = core_requirements.get(name, [])
-        desc_note = f"Only rows that include <strong>{core_effect_display.get(name, 'the core effect')}</strong> are shown. If a budget is missing, the core effect wasn't affordable yet."
+        desc_note = f"Every solved budget is shown. Rows outlined in red no longer include <strong>{core_effect_display.get(name, 'the core effect')}</strong> — the optimizer found a higher-scoring build without it at that budget."
         html_parts.append(f'<div id="{section_id}" class="arch-section">')
         html_parts.append(f'<div class="arch-desc"><strong>{name}</strong> &mdash; {desc}<br><span class="note">{desc_note}</span></div>')
         html_parts.append('<table><thead><tr><th>Points</th><th>God Root</th><th>Cost/N</th><th style="min-width:460px">Key stats (final in‑game values)</th><th>Planner</th></tr></thead><tbody>')
@@ -652,14 +644,16 @@ a.btn:hover{background:#161c36;color:#8898e8;border-color:#343860}
             if not build:
                 continue
             final_effects = aggregate_effects(build)
-            # Core effect check
             has_core = False
             for req in req_effects:
                 if final_effects.get(req, 0) > 0:
                     has_core = True
                     break
-            if not has_core:
-                continue
+            core_warning = ''
+            if req_effects and not has_core:
+                core_warning = (f'<div class="core-warn">&#9888; No longer includes '
+                                 f'{core_effect_display.get(name, "the core effect")} at this budget — '
+                                 f'the optimizer found a higher-scoring build without it.</div>')
 
             total_cost = sum(cost_map[nid] for nid in build)
             ids = sorted(build)
@@ -692,12 +686,13 @@ a.btn:hover{background:#161c36;color:#8898e8;border-color:#343860}
             pts_class = "col-pts hi" if b in [5,10] else "col-pts"
             if is_dup:
                 pts_class += " dup"
+            row_class = ' '.join(c for c in ['duplicate' if is_dup else '', 'no-core' if core_warning else ''] if c)
             html_parts.append(f"""
-            <tr class="{'duplicate' if is_dup else ''}">
+            <tr class="{row_class}">
                 <td class="{pts_class}">{b} {dup_label}</td>
                 <td class="col-root {root_class}">{root_name}</td>
                 <td class="col-meta">{total_cost}/{len(ids)}</td>
-                <td><div class="stats">{pill_html}</div></td>
+                <td><div class="stats">{pill_html}</div>{core_warning}</td>
                 <td><a class="btn" href="{url}" target="_blank">Open &#8599;</a></td>
             </tr>
             """)
@@ -712,6 +707,7 @@ a.btn:hover{background:#161c36;color:#8898e8;border-color:#343860}
         <li><strong>Keystones require ALL listed prerequisites</strong>, small/medium nodes need only one.</li>
         <li><strong>Root switches</strong> are marked by a new row with a different god.</li>
         <li><strong>Duplicate rows</strong> labelled <span style="color:#5a4a60;">(same as previous)</span> mean the optimal build hasn’t changed.</li>
+        <li><strong>Rows outlined in red</strong> mean the optimizer found a higher-scoring build at that budget that no longer includes the archetype's defining stat — every budget is always shown now, so a build path never silently disappears from the table without explanation.</li>
         <li><strong>Free-standing nodes</strong> (empty prerequisite list, e.g. Blindbag, Goliath's Reach, Pierce Faith chains) are directly selectable with no unlock chain required — confirmed via live in-game testing, not a guess.</li>
         <li><strong>Node 244</strong> now uses its real live prerequisite (103) as of 2026-07-06 — previously a guess, now confirmed data.</li>
         <li><strong>Devout Vessel</strong> = HP bonus from prayer bonus %, not damage.</li>
@@ -765,46 +761,49 @@ def main():
             raw = pickle.load(f)
         print(f"Resumed from checkpoint: {len(raw)} tasks already done")
 
-    all_tasks = [
-        (archetype_name, root, budget)
+    # Unit of parallel work is now one (archetype, root) sweep across every
+    # budget, not one (archetype, root, budget) triple — see
+    # _solve_root_sweep. This is what lets sequential warm-starting actually
+    # happen: budgets within a sweep run one after another in the same
+    # worker, each seeded from the previous budget's solution, instead of
+    # ~960 fully-independent cold starts.
+    all_groups = [
+        (archetype_name, root)
         for archetype_name in ARCHETYPE_WEIGHTS
         for root in sorted(GOD_ROOTS)
-        for budget in BUDGETS
     ]
-    remaining = [t for t in all_tasks if t not in raw]
+    all_tasks = [(a, r, b) for a, r in all_groups for b in BUDGETS]
     total = len(all_tasks)
-    print(f"{len(raw)}/{total} tasks already done, {len(remaining)} remaining")
+    remaining_groups = [
+        (a, r) for a, r in all_groups
+        if any((a, r, b) not in raw for b in BUDGETS)
+    ]
+    print(f"{len(raw)}/{total} tasks already done, "
+          f"{len(remaining_groups)}/{len(all_groups)} (archetype, root) sweeps remaining")
 
-    if remaining:
+    if remaining_groups:
         n_workers = os.cpu_count() or 4
-        # Chunk size = one full budget sweep for a given (archetype, root).
-        # Tasks are generated grouped by archetype, so this keeps each chunk
-        # within a single archetype in the common case — letting the
-        # precompute_marginal_scores cache actually pay off within a worker
-        # (it's keyed by archetype, so a worker that gets a mixed-archetype
-        # chunk would just recompute more than once, still fine) — while
-        # cutting inter-process overhead by ~20x versus sending one task at
-        # a time.
-        chunksize = max(1, len(BUDGETS))
-        print(f"Solving {len(remaining)} tasks across {n_workers} processes "
-              f"(TIME_LIMIT={TIME_LIMIT}s/solve, chunksize={chunksize})...")
+        # One sweep = one chunk; each already covers a full budget range
+        # internally (sequentially, with warm-start chaining), so there's no
+        # need for pool-level chunking on top of that.
+        print(f"Solving {len(remaining_groups)} sweeps across {n_workers} processes "
+              f"(TIME_LIMIT={TIME_LIMIT}s/solve)...")
         t0 = time.time()
         done_count = 0
-        SAVE_EVERY = max(1, len(remaining) // 40)  # ~40 checkpoint saves over the run
         with mp.Pool(processes=n_workers) as pool:
-            for archetype_name, root, budget, build, score, fell_back in pool.imap_unordered(
-                _solve_task, remaining, chunksize=chunksize
+            for archetype_name, root, results in pool.imap_unordered(
+                _solve_root_sweep, remaining_groups, chunksize=1
             ):
-                raw[(archetype_name, root, budget)] = (build, score, fell_back)
+                for budget, build, score, fell_back in results:
+                    raw[(archetype_name, root, budget)] = (build, score, fell_back)
                 done_count += 1
-                if done_count % SAVE_EVERY == 0 or done_count == len(remaining):
-                    with open(CHECKPOINT_FILE, "wb") as f:
-                        pickle.dump(raw, f)
-                    elapsed = time.time() - t0
-                    rate = done_count / elapsed if elapsed > 0 else 0
-                    eta = (len(remaining) - done_count) / rate if rate > 0 else float('inf')
-                    print(f"  {len(raw)}/{total} done "
-                          f"({rate:.1f} tasks/s, ETA {eta/60:.1f} min)", flush=True)
+                with open(CHECKPOINT_FILE, "wb") as f:
+                    pickle.dump(raw, f)
+                elapsed = time.time() - t0
+                rate = done_count / elapsed if elapsed > 0 else 0
+                eta = (len(remaining_groups) - done_count) / rate if rate > 0 else float('inf')
+                print(f"  {len(raw)}/{total} tasks done, {done_count}/{len(remaining_groups)} sweeps "
+                      f"({rate:.2f} sweeps/s, ETA {eta/60:.1f} min)", flush=True)
 
     # Reassemble the per-archetype, per-budget "best across roots" structure
     # that generate_html() expects.
